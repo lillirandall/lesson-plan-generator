@@ -9,114 +9,103 @@ from reportlab.pdfgen import canvas
 import docx
 import pdfplumber
 import re
-from typing import Dict, List
 
+# Load environment variables
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
+
+# Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    raise ValueError("Missing OpenAI API key in .env file")
 
-# Universal Field Detection
-def detect_template_fields(file_stream, filename: str) -> List[Dict]:
-    """Detects fillable areas in ANY template using AI-assisted analysis"""
-    if filename.lower().endswith('.pdf'):
-        return analyze_pdf_fields(file_stream)
-    elif filename.lower().endswith('.docx'):
-        return analyze_docx_fields(file_stream)
-    else:
-        raise ValueError("Unsupported file type")
-
-def analyze_pdf_fields(file_stream) -> List[Dict]:
-    """PDF field detection that works with most layouts"""
+def analyze_pdf_fields(file_stream):
+    """Safe PDF field detection that handles multiple template types"""
     fields = []
     try:
         with pdfplumber.open(file_stream) as pdf:
             for page in pdf.pages:
-                text = page.extract_text()
-                words = page.extract_words()
+                words = page.extract_words() or []
                 
-                # Find all potential field labels (text ending with :)
-                labels = [w for w in words if re.search(r':\s*$', w['text'])]
-                
-                for label in labels:
-                    fields.append({
-                        'label': label['text'],
-                        'x': label['x0'],
-                        'y': page.height - label['top'],
-                        'page': page.page_number
-                    })
+                # Detect label-value pairs
+                for i, word in enumerate(words):
+                    if isinstance(word, dict) and word.get('text', '').endswith(':'):
+                        fields.append({
+                            'label': word['text'],
+                            'x': word['x0'],
+                            'y': page.height - word['top'],
+                            'page': page.page_number
+                        })
     except Exception as e:
         print(f"PDF Analysis Error: {e}")
     return fields
 
-def analyze_docx_fields(file_stream) -> List[Dict]:
+def analyze_docx_fields(file_stream):
     """DOCX field detection for any template"""
     fields = []
     try:
         doc = docx.Document(file_stream)
-        for i, para in enumerate(doc.paragraphs):
-            if re.search(r':\s*$', para.text):
+        for para in doc.paragraphs:
+            if ':' in para.text:
                 fields.append({
-                    'label': para.text,
-                    'paragraph_index': i
+                    'label': para.text.split(':')[0] + ':',
+                    'paragraph': para
                 })
     except Exception as e:
         print(f"DOCX Analysis Error: {e}")
     return fields
 
-# Universal Content Generation
-def generate_template_content(fields: List[Dict], prompt: str) -> Dict:
+def generate_template_content(fields, prompt):
     """AI that adapts to any template structure"""
     field_list = "\n".join([f"{field['label']} [REPLACE THIS]" for field in fields])
     
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": f"""You are a template filling assistant. 
-             Fill these fields exactly as they appear, preserving all formatting:
-             {field_list}
-             User Request: {prompt}"""},
-            {"role": "user", "content": "Fill the template completely."}
+            {"role": "system", "content": f"""Fill this template:
+            {field_list}
+            User Request: {prompt}"""},
+            {"role": "user", "content": "Complete all fields exactly as shown."}
         ],
         temperature=0.3
     )
     
-    # Parse the AI response into field-value pairs
+    # Parse AI response
     filled_fields = {}
     for line in response.choices[0].message.content.split('\n'):
         if ':' in line:
-            label, value = line.split(':', 1)
-            filled_fields[label.strip()] = value.strip()
+            parts = line.split(':', 1)
+            filled_fields[parts[0].strip() + ':'] = parts[1].strip()
     
     return filled_fields
 
-# Universal Output Generation
-def create_filled_file(file_stream, filename: str, filled_fields: Dict):
-    if filename.lower().endswith('.pdf'):
-        return create_filled_pdf(file_stream, filled_fields)
-    elif filename.lower().endswith('.docx'):
-        return create_filled_docx(file_stream, filled_fields)
-
-def create_filled_pdf(file_stream, filled_fields: Dict):
-    """Handles any PDF layout by overlaying text at detected positions"""
+def create_filled_pdf(file_stream, filled_fields):
+    """PDF filling with safe coordinate handling"""
     packet = BytesIO()
     can = canvas.Canvas(packet)
     
     with pdfplumber.open(file_stream) as pdf:
         for field in filled_fields:
-            page = pdf.pages[field['page']-1]
-            can.drawString(field['x'], field['y'], filled_fields[field['label']])
+            page = pdf.pages[0]  # First page only for simplicity
+            can.drawString(
+                float(field['x']), 
+                float(field['y']), 
+                filled_fields[field['label']]
+            )
     
     can.save()
     packet.seek(0)
     return packet, "application/pdf"
 
-def create_filled_docx(file_stream, filled_fields: Dict):
-    """Handles any DOCX template by replacing text"""
+def create_filled_docx(file_stream, filled_fields):
+    """DOCX filling that preserves formatting"""
     doc = docx.Document(file_stream)
     for para in doc.paragraphs:
-        if para.text in filled_fields:
-            para.text = filled_fields[para.text]
+        if ':' in para.text:
+            label = para.text.split(':')[0] + ':'
+            if label in filled_fields:
+                para.text = label + ' ' + filled_fields[label]
     
     output = BytesIO()
     doc.save(output)
@@ -132,23 +121,35 @@ def process():
     prompt = request.form.get('prompt', '').strip()
     
     try:
-        # Universal processing flow
-        fields = detect_template_fields(file.stream, file.filename)
-        file.stream.seek(0)
-        
-        filled_fields = generate_template_content(fields, prompt)
-        file.stream.seek(0)
-        
-        filled_file, mimetype = create_filled_file(file.stream, file.filename, filled_fields)
-        
+        # Detect file type
+        if file.filename.lower().endswith('.pdf'):
+            fields = analyze_pdf_fields(file.stream)
+            file.stream.seek(0)
+            filled_fields = generate_template_content(fields, prompt)
+            file.stream.seek(0)
+            filled_file, mimetype = create_filled_pdf(file.stream, fields)
+            download_name = "filled_lesson_plan.pdf"
+        elif file.filename.lower().endswith('.docx'):
+            fields = analyze_docx_fields(file.stream)
+            file.stream.seek(0)
+            filled_fields = generate_template_content(fields, prompt)
+            file.stream.seek(0)
+            filled_file, mimetype = create_filled_docx(file.stream, filled_fields)
+            download_name = "filled_lesson_plan.docx"
+        else:
+            return jsonify({"error": "Unsupported file type (only PDF/DOCX)"}), 400
+
         return send_file(
             filled_file,
             mimetype=mimetype,
             as_attachment=True,
-            download_name=f"filled_{file.filename}"
+            download_name=download_name
         )
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
