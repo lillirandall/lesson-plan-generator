@@ -7,122 +7,79 @@ from io import BytesIO
 import PyPDF2
 from reportlab.pdfgen import canvas
 import pdfplumber
-import re
 
-# Load environment variables
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# Configure OpenAI with GPT-4 enforcement
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
-    raise ValueError("OpenAI API key missing in .env file")
-
-# SLPS Template Coordinates (pixels from top-left)
-SLPS_TEMPLATE_LAYOUT = {
-    'date': {'x': 100, 'y': 120},
-    'standards': {'x': 100, 'y': 180},
-    'objectives': {'x': 100, 'y': 250},
-    'wida_standards': {'x': 100, 'y': 320},
-    'materials': {'x': 100, 'y': 390},
-    'vocabulary': {'x': 100, 'y': 460},
-    'assessment': {'x': 100, 'y': 530},
-    'agenda': {'x': 100, 'y': 600}
+# SLPS Template Coordinates (x, y from top-left)
+SLPS_COORDINATES = {
+    'date': (100, 120),
+    'missouri_standards': (100, 180),
+    'learning_targets': (350, 180),
+    'wida_standards': (100, 220),
+    'language_objective': (350, 220),
+    'materials': (100, 260),
+    'vocabulary': (350, 260),
+    'assessment': (100, 300),
+    'criteria': (350, 300),
+    'do_now': (100, 370),
+    'i_do': (100, 420),
+    'we_do': (100, 470),
+    'you_do_together': (100, 520),
+    'you_do_alone': (100, 570),
+    'homework': (100, 620)
 }
 
-def analyze_slps_pdf(file_stream):
-    """Specialized analyzer for SLPS templates with precise coordinates"""
-    try:
-        with pdfplumber.open(file_stream) as pdf:
-            if not pdf.pages:
-                return []
-                
-            first_page = pdf.pages[0]
-            fields = []
-            
-            # Use predefined coordinates for SLPS template
-            for section, coords in SLPS_TEMPLATE_LAYOUT.items():
-                fields.append({
-                    'section': section,
-                    'x': coords['x'],
-                    'y': first_page.height - coords['y']  # Convert to PDF coordinate system
-                })
-            
-            return fields
-            
-    except Exception as e:
-        print(f"SLPS PDF Analysis Error: {e}")
-        return []
+def generate_slps_lesson(prompt):
+    """Specialized GPT-4 prompt for SLPS templates"""
+    return openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": """You are an SLPS lesson plan expert. Follow these rules:
+            1. Maintain EXACT template formatting including:
+               - Section headers
+               - Bullet points (●)
+               - Table structures
+            2. Fill ALL sections completely
+            3. Use professional educator language
+            4. Include time allocations (e.g., "Do Now (15min)")"""},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2,
+        max_tokens=2000
+    ).choices[0].message.content
 
-def generate_slps_content(prompt):
-    """GPT-4 prompt engineered specifically for SLPS templates"""
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": """You are an SLPS lesson plan specialist. Follow these rules:
-                1. Maintain EXACT template formatting including:
-                   - Section headers (e.g., "DAILY LESSON AGENDA")
-                   - Bullet points (•)
-                   - Time allocations (e.g., "Do Now (15min)")
-                2. Use professional educator language
-                3. Align with Missouri Learning Standards"""},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=2000
-        )
-        
-        # Debug: Verify GPT-4 usage
-        print(f"Model used: {response['model']}")
-        
-        return response.choices[0].message.content
-        
-    except Exception as e:
-        print(f"GPT-4 Generation Error: {e}")
-        raise
+def create_filled_pdf(original_pdf_path, content):
+    """Precise PDF filling for SLPS templates"""
+    # Create original PDF background
+    original = PyPDF2.PdfReader(original_pdf_path)
+    packet = BytesIO()
+    
+    # Set up canvas with original dimensions
+    page_width = original.pages[0].mediabox[2]
+    page_height = original.pages[0].mediabox[3]
+    can = canvas.Canvas(packet, pagesize=(page_width, page_height))
+    can.setFont("Helvetica", 10)  # Match template font
 
-def create_filled_slps_pdf(original_stream, content):
-    """PDF generator optimized for SLPS templates"""
-    try:
-        # Load original template as background
-        original_pdf = PyPDF2.PdfReader(original_stream)
-        packet = BytesIO()
-        
-        # Set canvas to match template size
-        page_width = original_pdf.pages[0].mediabox[2]
-        page_height = original_pdf.pages[0].mediabox[3]
-        can = canvas.Canvas(packet, pagesize=(page_width, page_height))
-        
-        # Configure professional educator styling
-        can.setFont("Helvetica", 10)
-        
-        # Parse and position content
-        for line in content.split('\n'):
-            if ':' in line:
-                section = line.split(':')[0].strip().lower()
-                if section in SLPS_TEMPLATE_LAYOUT:
-                    coords = SLPS_TEMPLATE_LAYOUT[section]
-                    can.drawString(coords['x'], page_height - coords['y'], line)
-        
-        can.save()
-        
-        # Merge with original template
-        new_pdf = PyPDF2.PdfReader(packet)
-        output_pdf = PyPDF2.PdfWriter()
-        page = original_pdf.pages[0]
-        page.merge_page(new_pdf.pages[0])
-        output_pdf.add_page(page)
-        
-        output_stream = BytesIO()
-        output_pdf.write(output_stream)
-        output_stream.seek(0)
-        return output_stream, "application/pdf"
-        
-    except Exception as e:
-        print(f"PDF Generation Error: {e}")
-        raise
+    # Add all content at precise positions
+    for section, (x, y) in SLPS_COORDINATES.items():
+        if section in content:
+            can.drawString(x, page_height - y, content[section])  # Convert to PDF coordinates
+
+    can.save()
+    
+    # Merge with original
+    new_pdf = PyPDF2.PdfReader(packet)
+    output = PyPDF2.PdfWriter()
+    page = original.pages[0]
+    page.merge_page(new_pdf.pages[0])
+    output.add_page(page)
+    
+    output_stream = BytesIO()
+    output.write(output_stream)
+    output_stream.seek(0)
+    return output_stream
 
 @app.route('/process', methods=['POST'])
 def process():
@@ -133,35 +90,40 @@ def process():
     prompt = request.form.get('prompt', '').strip()
     
     try:
-        # 1. Analyze template structure
-        fields = analyze_slps_pdf(file.stream)
-        if not fields:
-            raise ValueError("This doesn't appear to be an SLPS template")
+        # 1. Generate complete lesson plan content
+        full_prompt = f"""Create a complete SLPS lesson plan:
+        {prompt}
+        Include:
+        - Missouri Learning Standards
+        - WIDA Standards if applicable
+        - Detailed agenda with time allocations
+        - Assessment methods"""
         
-        # 2. Generate content
-        full_prompt = f"""Create a complete SLPS lesson plan using this template.
-        Requirements:
-        - {prompt}
-        - Fill ALL sections
-        - Include time allocations
-        - Align with Missouri Standards"""
+        lesson_content = generate_slps_lesson(full_prompt)
         
-        filled_content = generate_slps_content(full_prompt)
+        # 2. Parse into sections
+        content_sections = {}
+        current_section = None
+        for line in lesson_content.split('\n'):
+            if ':' in line:
+                current_section = line.split(':')[0].strip().lower()
+                content_sections[current_section] = line
+            elif current_section:
+                content_sections[current_section] += '\n' + line
         
-        # 3. Generate PDF
+        # 3. Generate filled PDF
         file.stream.seek(0)
-        filled_file, mimetype = create_filled_slps_pdf(file.stream, filled_content)
+        filled_pdf, _ = create_filled_pdf(file.stream, content_sections)
         
         return send_file(
-            filled_file,
-            mimetype=mimetype,
+            filled_pdf,
+            mimetype="application/pdf",
             as_attachment=True,
             download_name="SLPS_Lesson_Plan.pdf"
         )
         
     except Exception as e:
-        print(f"Processing Error: {str(e)}")
-        return jsonify({"error": f"Failed to generate lesson plan: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
