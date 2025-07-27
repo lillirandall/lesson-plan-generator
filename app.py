@@ -1,4 +1,5 @@
 from flask import Flask, request, send_file
+from flask_cors import CORS  # Critical for Webflow integration
 import openai
 import os
 from io import BytesIO
@@ -6,49 +7,45 @@ import PyPDF2
 from reportlab.pdfgen import canvas
 import docx
 from docx.shared import Pt
-import pdfplumber  # For smarter PDF analysis
+import pdfplumber
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Configure OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 def analyze_pdf_template(file_stream):
-    """Auto-detect editable fields in PDF"""
+    """Detect editable fields in PDF"""
     fields = []
     with pdfplumber.open(file_stream) as pdf:
         first_page = pdf.pages[0]
-        
-        # Detect text boxes (customize thresholds as needed)
         for word in first_page.extract_words():
             if len(word["text"]) < 3:  # Likely a field label
                 fields.append({
                     "x": word["x0"],
-                    "y": first_page.height - word["top"],  # Convert to bottom-left origin
+                    "y": first_page.height - word["top"],
                     "width": word["x1"] - word["x0"],
                     "text": word["text"]
                 })
     return fields
 
 def fill_pdf_dynamically(file_stream, prompt, fields):
-    """Fill detected PDF fields with AI content"""
-    # Generate AI content for each field
+    """Fill PDF fields with AI content"""
     ai_response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": f"Fill these template fields based on the prompt. Fields: {fields}"},
+            {"role": "system", "content": f"Fill these template fields: {fields}"},
             {"role": "user", "content": prompt}
         ]
     )
     ai_text = ai_response.choices[0].message.content
 
-    # Create a new PDF layer with filled text
+    # Create filled PDF layer
     packet = BytesIO()
     can = canvas.Canvas(packet)
-    
     for field in fields:
-        can.drawString(field["x"], field["y"], ai_text)  # Fill detected positions
-    
+        can.drawString(field["x"], field["y"], ai_text)
     can.save()
 
     # Merge with original PDF
@@ -56,7 +53,6 @@ def fill_pdf_dynamically(file_stream, prompt, fields):
     new_pdf = PyPDF2.PdfReader(packet)
     original_pdf = PyPDF2.PdfReader(file_stream)
     output = PyPDF2.PdfWriter()
-
     page = original_pdf.pages[0]
     page.merge_page(new_pdf.pages[0])
     output.add_page(page)
@@ -67,25 +63,22 @@ def fill_pdf_dynamically(file_stream, prompt, fields):
     return output_stream, "application/pdf"
 
 def fill_docx_dynamically(file_stream, prompt):
-    """Fill all paragraphs in DOCX (no fixed placeholders needed)"""
+    """Fill DOCX template"""
     doc = docx.Document(file_stream)
-    
-    # Generate AI content
     ai_response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": "Fill this lesson plan template:"},
+            {"role": "system", "content": "Fill this template:"},
             {"role": "user", "content": prompt}
         ]
     )
     ai_text = ai_response.choices[0].message.content
 
-    # Fill empty paragraphs or short placeholder text
     for paragraph in doc.paragraphs:
         if len(paragraph.text) < 5:  # Fill short/empty fields
             paragraph.text = ai_text
-            paragraph.style = "Normal"  # Preserve formatting
-    
+            paragraph.style = "Normal"
+
     output_stream = BytesIO()
     doc.save(output_stream)
     output_stream.seek(0)
@@ -103,7 +96,7 @@ def process():
     try:
         if file_ext == 'pdf':
             fields = analyze_pdf_template(file)
-            file.stream.seek(0)  # Reset stream after analysis
+            file.stream.seek(0)
             filled_file, mimetype = fill_pdf_dynamically(file, prompt, fields)
             download_name = "filled_template.pdf"
         elif file_ext == 'docx':
