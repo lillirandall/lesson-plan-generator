@@ -8,7 +8,6 @@ import PyPDF2
 from reportlab.pdfgen import canvas
 import docx
 import pdfplumber
-import re
 
 # Load environment variables
 load_dotenv()
@@ -21,7 +20,7 @@ if not openai.api_key:
     raise ValueError("Missing OpenAI API key in .env file")
 
 def analyze_pdf_fields(file_stream):
-    """Safe PDF field detection with robust error handling"""
+    """Detects fillable areas in PDF templates"""
     fields = []
     try:
         with pdfplumber.open(file_stream) as pdf:
@@ -29,64 +28,72 @@ def analyze_pdf_fields(file_stream):
                 return fields
                 
             first_page = pdf.pages[0]
-            words = first_page.extract_words() or []
+            text = first_page.extract_text()
             
-            for word in words:
-                if isinstance(word, dict):
-                    text = word.get('text', '')
-                    if isinstance(text, str) and text.endswith(':'):
-                        fields.append({
-                            'label': text,
-                            'x': float(word.get('x0', 0)),
-                            'y': float(first_page.height - word.get('top', 0)),
-                            'page': 0
-                        })
+            # Find all field labels (text ending with :)
+            for line in text.split('\n'):
+                if ':' in line:
+                    label = line.split(':')[0] + ':'
+                    fields.append({
+                        'label': label,
+                        'original_text': line,
+                        'page': 0,
+                        'x': 50,  # Default positions
+                        'y': 700  # Will be adjusted per field
+                    })
+                    
+            # Adjust y positions based on line numbers
+            for i, field in enumerate(fields):
+                field['y'] = 700 - (i * 20)  # 20pt vertical spacing
+                
     except Exception as e:
         print(f"PDF Analysis Error: {e}")
     return fields
 
 def analyze_docx_fields(file_stream):
-    """Safe DOCX field detection"""
+    """Detects fillable areas in DOCX templates"""
     fields = []
     try:
         doc = docx.Document(file_stream)
         for para in doc.paragraphs:
             if ':' in para.text:
-                label = para.text.split(':', 1)[0] + ':'
+                label = para.text.split(':')[0] + ':'
                 fields.append({
                     'label': label,
-                    'text': para.text
+                    'paragraph': para,
+                    'original_text': para.text
                 })
     except Exception as e:
         print(f"DOCX Analysis Error: {e}")
     return fields
 
 def generate_template_content(fields, prompt):
-    """AI content generation with robust error handling"""
+    """Generates AI content that matches template structure"""
     if not fields:
         return {}
         
     try:
-        field_prompt = "\n".join([f"{field['label']} [REPLACE THIS]" for field in fields])
+        # Create example of current template
+        template_example = "\n".join([field['original_text'] for field in fields])
         
         response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": f"""Fill these template fields exactly:
-                {field_prompt}
+                {"role": "system", "content": f"""You are filling out a lesson plan template. 
+                Maintain the EXACT format shown below:
+                {template_example}
                 User Request: {prompt}"""},
-                {"role": "user", "content": "Fill all fields maintaining original format"}
+                {"role": "user", "content": "Fill in all fields while preserving the original format exactly."}
             ],
-            temperature=0.3
+            temperature=0.2  # Low for consistent formatting
         )
         
+        # Parse response while maintaining structure
         filled_fields = {}
-        if response.choices:
-            for line in response.choices[0].message.content.split('\n'):
-                if ':' in line:
-                    parts = line.split(':', 1)
-                    if len(parts) == 2:
-                        filled_fields[parts[0].strip() + ':'] = parts[1].strip()
+        for line in response.choices[0].message.content.split('\n'):
+            if ':' in line:
+                parts = line.split(':', 1)
+                filled_fields[parts[0].strip() + ':'] = parts[1].strip()
         
         return filled_fields
     except Exception as e:
@@ -94,35 +101,53 @@ def generate_template_content(fields, prompt):
         return {}
 
 def create_filled_pdf(file_stream, fields, filled_fields):
-    """PDF generation with coordinate safety checks"""
+    """Generates PDF with original template as background + new text"""
     try:
+        # Create original PDF background
+        original_pdf = PyPDF2.PdfReader(file_stream)
         packet = BytesIO()
-        can = canvas.Canvas(packet)
         
-        with pdfplumber.open(file_stream) as pdf:
-            if pdf.pages:
-                for field in fields:
-                    if field['label'] in filled_fields:
-                        can.drawString(
-                            field['x'],
-                            field['y'],
-                            filled_fields[field['label']]
-                        )
+        # Get page size from original
+        page_width = original_pdf.pages[0].mediabox[2]
+        page_height = original_pdf.pages[0].mediabox[3]
+        
+        # Create canvas with same dimensions
+        can = canvas.Canvas(packet, pagesize=(page_width, page_height))
+        
+        # Add all filled text (using Helvetica font)
+        can.setFont("Helvetica", 10)
+        for field in fields:
+            if field['label'] in filled_fields:
+                can.drawString(
+                    field['x'],
+                    field['y'],
+                    filled_fields[field['label']]
+                )
         
         can.save()
-        packet.seek(0)
-        return packet, "application/pdf"
+        
+        # Merge with original
+        new_pdf = PyPDF2.PdfReader(packet)
+        output_pdf = PyPDF2.PdfWriter()
+        page = original_pdf.pages[0]
+        page.merge_page(new_pdf.pages[0])
+        output_pdf.add_page(page)
+        
+        output_stream = BytesIO()
+        output_pdf.write(output_stream)
+        output_stream.seek(0)
+        return output_stream, "application/pdf"
     except Exception as e:
         print(f"PDF Generation Error: {e}")
         raise
 
 def create_filled_docx(file_stream, filled_fields):
-    """DOCX generation with paragraph safety checks"""
+    """Generates filled DOCX while preserving formatting"""
     try:
         doc = docx.Document(file_stream)
         for para in doc.paragraphs:
             if ':' in para.text:
-                label = para.text.split(':', 1)[0] + ':'
+                label = para.text.split(':')[0] + ':'
                 if label in filled_fields:
                     para.text = label + ' ' + filled_fields[label]
         
