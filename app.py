@@ -14,11 +14,33 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Coordinates for known SLPS static PDF templates
+STATIC_COORDINATES = {
+    'date': (100, 120),
+    'standards': (100, 180),
+    'objectives': (350, 180),
+    'wida': (100, 220),
+    'language_obj': (350, 220),
+    'materials': (100, 260),
+    'vocabulary': (350, 260),
+    'assessment': (100, 300),
+    'success_criteria': (350, 300),
+    'do_now': (100, 370),
+    'i_do': (100, 420),
+    'we_do': (100, 470),
+    'you_do_together': (100, 520),
+    'you_do_alone': (100, 570),
+    'homework': (100, 620)
+}
+
+# Generate lesson content using GPT
 def generate_slps_content(prompt):
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": """You are a lesson plan expert. Respond ONLY in this labeled format with curly brace keys. Example:
+            {
+                "role": "system",
+                "content": """You are a lesson plan assistant. Respond ONLY in this format with curly-brace placeholders:
 {{date}}:
 {{standards}}:
 {{objectives}}:
@@ -33,7 +55,8 @@ def generate_slps_content(prompt):
 {{we_do}}:
 {{you_do_together}}:
 {{you_do_alone}}:
-{{homework}}:"""},
+{{homework}}:"""
+            },
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
@@ -41,11 +64,13 @@ def generate_slps_content(prompt):
     )
     return response.choices[0].message.content
 
+# Extract curly-brace placeholders from AI response
 def parse_lesson_content(content):
     pattern = r'\{\{(.*?)\}\}:(.*?)(?=\n\{\{|\Z)'
     matches = re.findall(pattern, content, re.DOTALL)
     return {k.strip().lower(): v.strip() for k, v in matches}
 
+# Extract placeholders from DOCX
 def extract_placeholders_docx(doc):
     placeholders = set()
     for para in doc.paragraphs:
@@ -54,6 +79,7 @@ def extract_placeholders_docx(doc):
             placeholders.add(match.strip().lower())
     return placeholders
 
+# Extract placeholders from PDF text
 def extract_placeholders_pdf(pdf_stream):
     text = ""
     reader = PyPDF2.PdfReader(pdf_stream)
@@ -64,6 +90,7 @@ def extract_placeholders_pdf(pdf_stream):
             continue
     return set(re.findall(r'\{\{(.*?)\}\}', text.lower()))
 
+# Fill a Word doc using placeholders
 def fill_docx_template(doc_stream, sections):
     doc = Document(doc_stream)
     for para in doc.paragraphs:
@@ -78,7 +105,8 @@ def fill_docx_template(doc_stream, sections):
     output_stream.seek(0)
     return output_stream
 
-def fill_pdf_template(pdf_stream, sections):
+# Fill a PDF using text overlays based on detected placeholders
+def fill_pdf_with_placeholders(pdf_stream, sections):
     reader = PyPDF2.PdfReader(pdf_stream)
     page = reader.pages[0]
     page_width = float(page.mediabox.width)
@@ -108,6 +136,38 @@ def fill_pdf_template(pdf_stream, sections):
     output_stream.seek(0)
     return output_stream
 
+# Fill PDF using hardcoded coordinates for static layouts
+def fill_pdf_with_coordinates(pdf_stream, sections):
+    reader = PyPDF2.PdfReader(pdf_stream)
+    page = reader.pages[0]
+    page_width = float(page.mediabox.width)
+    page_height = float(page.mediabox.height)
+
+    packet = BytesIO()
+    can = canvas.Canvas(packet, pagesize=(page_width, page_height))
+    can.setFont("Helvetica", 10)
+
+    for section, (x, y) in STATIC_COORDINATES.items():
+        if section in sections:
+            text = can.beginText(x, page_height - y)
+            for line in sections[section].split('\n'):
+                text.textLine(line.strip())
+            can.drawText(text)
+
+    can.save()
+    packet.seek(0)
+
+    overlay = PyPDF2.PdfReader(packet)
+    writer = PyPDF2.PdfWriter()
+    page.merge_page(overlay.pages[0])
+    writer.add_page(page)
+
+    output_stream = BytesIO()
+    writer.write(output_stream)
+    output_stream.seek(0)
+    return output_stream
+
+# Main API route
 @app.route('/process', methods=['POST'])
 def process():
     if 'file' not in request.files:
@@ -119,8 +179,9 @@ def process():
     ext = os.path.splitext(filename)[1].lower()
 
     try:
+        # Generate AI content
         lesson_text = generate_slps_content(
-            f"Create a full lesson plan about: {prompt}. Use curly-brace labels like {{objectives}} for each section."
+            f"Create a full SLPS-style lesson plan about: {prompt}. Use curly-brace labels like {{objectives}}."
         )
         sections = parse_lesson_content(lesson_text)
 
@@ -135,17 +196,22 @@ def process():
 
         elif ext == ".pdf":
             placeholders = extract_placeholders_pdf(file.stream)
-            filtered = {k: v for k, v in sections.items() if k in placeholders}
             file.stream.seek(0)
-            output_stream = fill_pdf_template(file.stream, filtered)
+            if placeholders:
+                filtered = {k: v for k, v in sections.items() if k in placeholders}
+                output_stream = fill_pdf_with_placeholders(file.stream, filtered)
+            else:
+                output_stream = fill_pdf_with_coordinates(file.stream, sections)
+
             return send_file(output_stream, mimetype="application/pdf",
                              as_attachment=True, download_name="Filled_Lesson_Plan.pdf")
         else:
             return jsonify({"error": "Unsupported file type"}), 400
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Internal Error: {str(e)}")
         return jsonify({"error": f"Lesson plan generation failed: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
+
