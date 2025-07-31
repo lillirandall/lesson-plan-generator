@@ -15,6 +15,25 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Coordinates for SLPS-style fallback template
+STATIC_COORDINATES = {
+    'date': (60, 705),
+    'standards': (60, 680),
+    'objectives': (60, 655),
+    'wida': (60, 630),
+    'language_obj': (60, 605),
+    'materials': (60, 580),
+    'vocabulary': (300, 580),
+    'assessment': (60, 540),
+    'success_criteria': (300, 540),
+    'do_now': (60, 470),
+    'i_do': (60, 445),
+    'we_do': (60, 420),
+    'you_do_together': (60, 395),
+    'you_do_alone': (60, 370),
+    'homework': (60, 345)
+}
+
 def generate_slps_content(prompt):
     response = openai.ChatCompletion.create(
         model="gpt-4",
@@ -58,15 +77,15 @@ def extract_placeholders_docx(doc):
             placeholders.add(match.strip().lower())
     return placeholders
 
-def extract_placeholders_pdf(pdf_stream):
-    text = ""
+def extract_text_pdf(pdf_stream):
     reader = PyPDF2.PdfReader(pdf_stream)
+    full_text = ""
     for page in reader.pages:
         try:
-            text += page.extract_text()
+            full_text += page.extract_text().lower() + "\n"
         except:
             continue
-    return set(re.findall(r'\{\{(.*?)\}\}', text.lower()))
+    return full_text
 
 def fill_docx_template(doc_stream, sections):
     doc = Document(doc_stream)
@@ -82,24 +101,54 @@ def fill_docx_template(doc_stream, sections):
     output_stream.seek(0)
     return output_stream
 
-def dynamic_pdf_fill(pdf_stream, sections):
+def fill_pdf_static_coords(pdf_stream, sections):
     reader = PyPDF2.PdfReader(pdf_stream)
     writer = PyPDF2.PdfWriter()
+    page = reader.pages[0]
 
-    for page_num, page in enumerate(reader.pages):
+    packet = BytesIO()
+    can = canvas.Canvas(packet, pagesize=page.mediabox)
+    can.setFont("Helvetica", 9)
+
+    for section, (x, y) in STATIC_COORDINATES.items():
+        if section in sections:
+            lines = simpleSplit(sections[section], "Helvetica", 9, 230)
+            for line in lines:
+                can.drawString(x, y, line)
+                y -= 12
+
+    can.save()
+    packet.seek(0)
+
+    overlay = PyPDF2.PdfReader(packet)
+    page.merge_page(overlay.pages[0])
+    writer.add_page(page)
+
+    output_stream = BytesIO()
+    writer.write(output_stream)
+    output_stream.seek(0)
+    return output_stream
+
+def fill_pdf_dynamic_or_fallback(pdf_stream, sections):
+    reader = PyPDF2.PdfReader(pdf_stream)
+    writer = PyPDF2.PdfWriter()
+    matched = False
+
+    for page_index, page in enumerate(reader.pages):
         text = page.extract_text().lower() if page.extract_text() else ""
         packet = BytesIO()
         can = canvas.Canvas(packet, pagesize=page.mediabox)
         can.setFont("Helvetica", 9)
 
-        for key, value in sections.items():
+        keys_used = 0
+        for key, val in sections.items():
             if key in text:
-                lines = text.split('\n')
-                for i, line in enumerate(lines):
+                keys_used += 1
+                for i, line in enumerate(text.split('\n')):
                     if key in line:
                         y = float(page.mediabox.height) - (12 * (i + 1))
                         x = 50
-                        wrapped = simpleSplit(value, "Helvetica", 9, 450)
+                        wrapped = simpleSplit(val, "Helvetica", 9, 450)
                         for wline in wrapped:
                             can.drawString(x, y, wline)
                             y -= 12
@@ -108,9 +157,15 @@ def dynamic_pdf_fill(pdf_stream, sections):
         can.save()
         packet.seek(0)
         overlay = PyPDF2.PdfReader(packet)
-        base_page = page
-        base_page.merge_page(overlay.pages[0])
-        writer.add_page(base_page)
+        page.merge_page(overlay.pages[0])
+        writer.add_page(page)
+
+        if keys_used > 0:
+            matched = True
+
+    if not matched:
+        pdf_stream.seek(0)
+        return fill_pdf_static_coords(pdf_stream, sections)
 
     output_stream = BytesIO()
     writer.write(output_stream)
@@ -145,13 +200,7 @@ def process():
                              download_name="Filled_Lesson_Plan.docx")
 
         elif ext == ".pdf":
-            placeholders = extract_placeholders_pdf(file.stream)
-            file.stream.seek(0)
-            if placeholders:
-                filtered = {k: v for k, v in sections.items() if k in placeholders}
-            else:
-                filtered = sections
-            output_stream = dynamic_pdf_fill(file.stream, filtered)
+            output_stream = fill_pdf_dynamic_or_fallback(file.stream, sections)
             return send_file(output_stream,
                              mimetype="application/pdf",
                              as_attachment=True,
@@ -166,3 +215,4 @@ def process():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
+
