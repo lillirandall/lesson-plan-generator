@@ -7,6 +7,7 @@ from io import BytesIO
 import PyPDF2
 from reportlab.pdfgen import canvas
 import pdfplumber
+import re
 
 load_dotenv()
 app = Flask(__name__)
@@ -15,14 +16,14 @@ CORS(app)
 # SLPS Template Coordinates (x, y from top-left)
 SLPS_COORDINATES = {
     'date': (100, 120),
-    'missouri_standards': (100, 180),
-    'learning_targets': (350, 180),
-    'wida_standards': (100, 220),
-    'language_objective': (350, 220),
+    'standards': (100, 180),         # Missouri Standards
+    'objectives': (350, 180),        # Learning Targets
+    'wida': (100, 220),              # WIDA Standards
+    'language_obj': (350, 220),      # Language Objective
     'materials': (100, 260),
     'vocabulary': (350, 260),
     'assessment': (100, 300),
-    'criteria': (350, 300),
+    'success_criteria': (350, 300),
     'do_now': (100, 370),
     'i_do': (100, 420),
     'we_do': (100, 470),
@@ -31,45 +32,77 @@ SLPS_COORDINATES = {
     'homework': (100, 620)
 }
 
-def generate_slps_lesson(prompt):
+def generate_slps_content(prompt):
     """Specialized GPT-4 prompt for SLPS templates"""
-    return openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": """You are an SLPS lesson plan expert. Follow these rules:
-            1. Maintain EXACT template formatting including:
-               - Section headers
-               - Bullet points (●)
-               - Table structures
-            2. Fill ALL sections completely
-            3. Use professional educator language
-            4. Include time allocations (e.g., "Do Now (15min)")"""},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=2000
-    ).choices[0].message.content
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": """You are an SLPS lesson plan specialist. Follow these rules:
+                1. Maintain EXACT template formatting
+                2. Fill ALL sections completely
+                3. Use bullet points (•) for activities
+                4. Include time allocations (e.g., "Do Now (5min)")
+                5. Return in this EXACT format:
+                DATE: [date]
+                STANDARDS: [standard]
+                OBJECTIVES: [objective]
+                WIDA: [wida standard]
+                LANGUAGE_OBJ: [language objective]
+                MATERIALS: [materials]
+                VOCABULARY: [vocabulary]
+                ASSESSMENT: [assessment]
+                SUCCESS_CRITERIA: [criteria]
+                DO_NOW: • Activity (time)
+                I_DO: • Activity (time)
+                WE_DO: • Activity (time)
+                YOU_DO_TOGETHER: • Activity (time)
+                YOU_DO_ALONE: • Activity (time)
+                HOMEWORK: • Activity"""},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=2000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"GPT-4 Error: {e}")
+        raise
 
-def create_filled_pdf(original_pdf_path, content):
-    """Precise PDF filling for SLPS templates"""
-    # Create original PDF background
-    original = PyPDF2.PdfReader(original_pdf_path)
+def parse_lesson_content(content):
+    """Extracts sections from GPT-4 response"""
+    sections = {}
+    current_section = None
+    
+    for line in content.split('\n'):
+        if ':' in line:
+            section, value = line.split(':', 1)
+            current_section = section.strip().lower()
+            sections[current_section] = value.strip()
+        elif current_section:
+            sections[current_section] += '\n' + line.strip()
+    
+    return sections
+
+def create_slps_pdf(original_pdf, sections):
+    """Generates PDF with precise text placement"""
     packet = BytesIO()
     
-    # Set up canvas with original dimensions
+    # Set up canvas using original PDF dimensions
+    original = PyPDF2.PdfReader(original_pdf)
     page_width = original.pages[0].mediabox[2]
     page_height = original.pages[0].mediabox[3]
     can = canvas.Canvas(packet, pagesize=(page_width, page_height))
     can.setFont("Helvetica", 10)  # Match template font
 
-    # Add all content at precise positions
+    # Add text at precise coordinates
     for section, (x, y) in SLPS_COORDINATES.items():
-        if section in content:
-            can.drawString(x, page_height - y, content[section])  # Convert to PDF coordinates
+        if section in sections:
+            can.drawString(x, page_height - y, sections[section])
 
     can.save()
     
-    # Merge with original
+    # Merge with original template
     new_pdf = PyPDF2.PdfReader(packet)
     output = PyPDF2.PdfWriter()
     page = original.pages[0]
@@ -90,30 +123,19 @@ def process():
     prompt = request.form.get('prompt', '').strip()
     
     try:
-        # 1. Generate complete lesson plan content
-        full_prompt = f"""Create a complete SLPS lesson plan:
-        {prompt}
-        Include:
-        - Missouri Learning Standards
-        - WIDA Standards if applicable
-        - Detailed agenda with time allocations
-        - Assessment methods"""
-        
-        lesson_content = generate_slps_lesson(full_prompt)
+        # 1. Generate content
+        lesson_content = generate_slps_content(
+            f"Create a complete SLPS lesson plan about: {prompt}\n"
+            "Include Missouri Standards, WIDA Standards (if applicable), "
+            "and detailed time allocations for each activity."
+        )
         
         # 2. Parse into sections
-        content_sections = {}
-        current_section = None
-        for line in lesson_content.split('\n'):
-            if ':' in line:
-                current_section = line.split(':')[0].strip().lower()
-                content_sections[current_section] = line
-            elif current_section:
-                content_sections[current_section] += '\n' + line
+        sections = parse_lesson_content(lesson_content)
         
-        # 3. Generate filled PDF
+        # 3. Generate PDF
         file.stream.seek(0)
-        filled_pdf, _ = create_filled_pdf(file.stream, content_sections)
+        filled_pdf = create_slps_pdf(file.stream, sections)
         
         return send_file(
             filled_pdf,
@@ -123,7 +145,8 @@ def process():
         )
         
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {str(e)}")
+        return jsonify({"error": f"Lesson plan generation failed: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
