@@ -1,3 +1,5 @@
+# [START OF FILE]
+
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -38,7 +40,7 @@ def generate_slps_content(prompt):
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": """You are a lesson plan assistant. Respond in this format:
+            {"role": "system", "content": """You are a lesson plan generator. Reply ONLY in this format:
 {{date}}:
 {{standards}}:
 {{objectives}}:
@@ -54,40 +56,36 @@ def generate_slps_content(prompt):
 {{you_do_together}}:
 {{you_do_alone}}:
 {{homework}}:"""},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": f"Create a lesson plan for: {prompt}"}
         ],
-        temperature=0.2,
+        temperature=0.3,
         max_tokens=2000
     )
     return response.choices[0].message.content
 
 def parse_lesson_content(content):
     pattern = r'\{\{(.*?)\}\}:(.*?)(?=\n\{\{|\Z)'
-    matches = re.findall(pattern, content, re.DOTALL)
-    return {k.strip().lower(): v.strip() for k, v in matches}
+    return {k.strip().lower(): v.strip() for k, v in re.findall(pattern, content, re.DOTALL)}
 
 def detect_label_positions(pdf_stream, label_keywords):
     pdf_stream.seek(0)
     doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
     positions = {}
     for page_num in range(len(doc)):
-        page = doc[page_num]
-        blocks = page.get_text("blocks")
-        for block in blocks:
+        for block in doc[page_num].get_text("blocks"):
             text = block[4].strip().lower()
             for key, label in label_keywords.items():
                 if label in text and key not in positions:
-                    x, y = block[0] + 100, block[1]
-                    positions[key] = (x, y, page_num)
+                    positions[key] = (block[0] + 100, block[1], page_num)
     return positions
 
 def fill_pdf(pdf_stream, sections, coords, page_count):
     pdf_stream.seek(0)
     reader = PyPDF2.PdfReader(pdf_stream)
     writer = PyPDF2.PdfWriter()
-
     packets = [BytesIO() for _ in range(page_count)]
     canvases = []
+
     for i in range(page_count):
         page = reader.pages[i]
         width = float(page.mediabox.width)
@@ -99,31 +97,35 @@ def fill_pdf(pdf_stream, sections, coords, page_count):
     if coords:
         for section, value in sections.items():
             if section in coords:
-                x, y, page_num = coords[section]
-                _, height = canvases[page_num][1], canvases[page_num][2]
-                y_draw = height - y
-                lines = simpleSplit(value, "Helvetica", 9, 400)
-                for line in lines:
-                    canvases[page_num][0].drawString(x, y_draw, line)
-                    y_draw -= 12
+                x, y, page = coords[section]
+                y = canvases[page][2] - y
+                for line in simpleSplit(value, "Helvetica", 9, 400):
+                    canvases[page][0].drawString(x, y, line)
+                    y -= 12
     else:
-        # fallback: generic vertical layout
-        start_y = canvases[0][2] - 100
+        y = canvases[0][2] - 100
         x = 80
+        page = 0
         for section, value in sections.items():
-            lines = simpleSplit(f"{section.upper()}: {value}", "Helvetica", 9, 400)
-            for line in lines:
-                canvases[0][0].drawString(x, start_y, line)
-                start_y -= 12
-            start_y -= 8
-
-    for i in range(page_count):
-        canvases[i][0].save()
-        packets[i].seek(0)
-        overlay = PyPDF2.PdfReader(packets[i])
-        base_page = reader.pages[i]
-        base_page.merge_page(overlay.pages[0])
-        writer.add_page(base_page)
+            for line in simpleSplit(f"{section.upper()}: {value}", "Helvetica", 9, 450):
+                canvases[page][0].drawString(x, y, line)
+                y -= 12
+                if y < 100 and page + 1 < len(canvases):
+                    canvases[page][0].save()
+                    packets[page].seek(0)
+                    overlay = PyPDF2.PdfReader(packets[page])
+                    reader.pages[page].merge_page(overlay.pages[0])
+                    writer.add_page(reader.pages[page])
+                    page += 1
+                    y = canvases[page][2] - 100
+        if page < len(canvases):
+            canvases[page][0].save()
+            packets[page].seek(0)
+            overlay = PyPDF2.PdfReader(packets[page])
+            reader.pages[page].merge_page(overlay.pages[0])
+            writer.add_page(reader.pages[page])
+    for i in range(page + 1, len(canvases)):
+        writer.add_page(reader.pages[i])
 
     output = BytesIO()
     writer.write(output)
@@ -134,10 +136,12 @@ def fill_docx_template(doc_stream, sections):
     doc = Document(doc_stream)
     for para in doc.paragraphs:
         for key, value in sections.items():
-            pattern = re.compile(rf'\{{\{{\s*{key}\s*\}}\}}', re.IGNORECASE)
-            if pattern.search(para.text):
+            placeholder_pattern = re.compile(rf'\{{\{{\s*{re.escape(key)}\s*\}}\}}', re.IGNORECASE)
+            if placeholder_pattern.search(para.text.lower()):
                 for run in para.runs:
-                    run.text = pattern.sub(value, run.text)
+                    run.text = placeholder_pattern.sub(value, run.text)
+            elif key in para.text.lower():
+                para.text = re.sub(key, value, para.text, flags=re.IGNORECASE)
     output = BytesIO()
     doc.save(output)
     output.seek(0)
@@ -153,7 +157,7 @@ def process():
     ext = os.path.splitext(secure_filename(file.filename))[1].lower()
 
     try:
-        content = generate_slps_content(f"Create a lesson plan for: {prompt}")
+        content = generate_slps_content(prompt)
         sections = parse_lesson_content(content)
 
         if ext == ".pdf":
