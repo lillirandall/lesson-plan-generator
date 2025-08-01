@@ -1,5 +1,3 @@
-# [START OF FILE]
-
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -19,44 +17,29 @@ app = Flask(__name__)
 CORS(app)
 
 LABEL_KEYWORDS = {
-    'date': "date",
-    'standards': "standard",
-    'objectives': "objective",
-    'wida': "wida",
-    'language_obj': "language objective",
-    'materials': "materials",
-    'vocabulary': "vocabulary",
-    'assessment': "assessment",
-    'success_criteria': "success criteria",
-    'do_now': "do now",
-    'i_do': "i do",
-    'we_do': "we do",
-    'you_do_together': "you do together",
-    'you_do_alone': "you do alone",
-    'homework': "homework"
+    'date': ["date", "day"],
+    'standards': ["standard", "standards"],
+    'objectives': ["objective", "learning target"],
+    'wida': ["wida"],
+    'language_obj': ["language objective"],
+    'materials': ["materials"],
+    'vocabulary': ["vocabulary"],
+    'assessment': ["assessment"],
+    'success_criteria': ["success criteria"],
+    'do_now': ["do now", "bell ringer"],
+    'i_do': ["i do", "teacher modeling"],
+    'we_do': ["we do", "guided practice"],
+    'you_do_together': ["you do together", "collaborative"],
+    'you_do_alone': ["you do alone", "independent"],
+    'homework': ["homework", "extension activity"]
 }
 
 def generate_slps_content(prompt):
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": """You are a lesson plan generator. Reply ONLY in this format:
-{{date}}:
-{{standards}}:
-{{objectives}}:
-{{wida}}:
-{{language_obj}}:
-{{materials}}:
-{{vocabulary}}:
-{{assessment}}:
-{{success_criteria}}:
-{{do_now}}:
-{{i_do}}:
-{{we_do}}:
-{{you_do_together}}:
-{{you_do_alone}}:
-{{homework}}:"""},
-            {"role": "user", "content": f"Create a lesson plan for: {prompt}"}
+            {"role": "system", "content": "You are a lesson plan generator. Reply ONLY in this format: {{section_name}}: content"},
+            {"role": "user", "content": f"Create a detailed lesson plan for: {prompt} using standard lesson plan sections."}
         ],
         temperature=0.3,
         max_tokens=2000
@@ -67,83 +50,57 @@ def parse_lesson_content(content):
     pattern = r'\{\{(.*?)\}\}:(.*?)(?=\n\{\{|\Z)'
     return {k.strip().lower(): v.strip() for k, v in re.findall(pattern, content, re.DOTALL)}
 
-def detect_label_positions(pdf_stream, label_keywords):
-    pdf_stream.seek(0)
-    doc = fitz.open(stream=pdf_stream.read(), filetype="pdf")
-    positions = {}
-    for page_num in range(len(doc)):
-        for block in doc[page_num].get_text("blocks"):
-            text = block[4].strip().lower()
-            for key, label in label_keywords.items():
-                if label in text and key not in positions:
-                    positions[key] = (block[0] + 100, block[1], page_num)
-    return positions
-
-def fill_pdf(pdf_stream, sections, coords, page_count):
-    pdf_stream.seek(0)
-    reader = PyPDF2.PdfReader(pdf_stream)
-    writer = PyPDF2.PdfWriter()
-    packets = [BytesIO() for _ in range(page_count)]
-    canvases = []
-
-    for i in range(page_count):
-        page = reader.pages[i]
-        width = float(page.mediabox.width)
-        height = float(page.mediabox.height)
-        can = canvas.Canvas(packets[i], pagesize=(width, height))
-        can.setFont("Helvetica", 9)
-        canvases.append((can, width, height))
-
-    if coords:
-        for section, value in sections.items():
-            if section in coords:
-                x, y, page = coords[section]
-                y = canvases[page][2] - y
-                for line in simpleSplit(value, "Helvetica", 9, 400):
-                    canvases[page][0].drawString(x, y, line)
-                    y -= 12
-    else:
-        y = canvases[0][2] - 100
-        x = 80
-        page = 0
-        for section, value in sections.items():
-            for line in simpleSplit(f"{section.upper()}: {value}", "Helvetica", 9, 450):
-                canvases[page][0].drawString(x, y, line)
-                y -= 12
-                if y < 100 and page + 1 < len(canvases):
-                    canvases[page][0].save()
-                    packets[page].seek(0)
-                    overlay = PyPDF2.PdfReader(packets[page])
-                    reader.pages[page].merge_page(overlay.pages[0])
-                    writer.add_page(reader.pages[page])
-                    page += 1
-                    y = canvases[page][2] - 100
-        if page < len(canvases):
-            canvases[page][0].save()
-            packets[page].seek(0)
-            overlay = PyPDF2.PdfReader(packets[page])
-            reader.pages[page].merge_page(overlay.pages[0])
-            writer.add_page(reader.pages[page])
-    for i in range(page + 1, len(canvases)):
-        writer.add_page(reader.pages[i])
-
+def fill_docx_by_heading(doc_stream, sections):
+    doc = Document(doc_stream)
+    for para in doc.paragraphs:
+        text = para.text.strip().lower()
+        for section, keywords in LABEL_KEYWORDS.items():
+            if any(keyword in text for keyword in keywords) and section in sections:
+                index = doc.paragraphs.index(para)
+                doc.paragraphs.insert(index + 1, doc.add_paragraph(sections[section]))
+                break
     output = BytesIO()
-    writer.write(output)
+    doc.save(output)
     output.seek(0)
     return output
 
-def fill_docx_template(doc_stream, sections):
-    doc = Document(doc_stream)
-    for para in doc.paragraphs:
-        for key, value in sections.items():
-            placeholder_pattern = re.compile(rf'\{{\{{\s*{re.escape(key)}\s*\}}\}}', re.IGNORECASE)
-            if placeholder_pattern.search(para.text.lower()):
-                for run in para.runs:
-                    run.text = placeholder_pattern.sub(value, run.text)
-            elif key in para.text.lower():
-                para.text = re.sub(key, value, para.text, flags=re.IGNORECASE)
+def fallback_pdf_writer(sections, width, height):
+    packet = BytesIO()
+    can = canvas.Canvas(packet, pagesize=(width, height))
+    can.setFont("Helvetica", 10)
+    y = height - 50
+    for key, value in sections.items():
+        lines = simpleSplit(f"{key.upper()}: {value}", "Helvetica", 10, width - 100)
+        for line in lines:
+            can.drawString(50, y, line)
+            y -= 12
+        y -= 8
+        if y < 60:
+            break
+    can.save()
+    packet.seek(0)
+    return packet
+
+def fill_pdf_static(pdf_stream, sections):
+    pdf_stream.seek(0)
+    reader = PyPDF2.PdfReader(pdf_stream)
+    writer = PyPDF2.PdfWriter()
+
+    base_page = reader.pages[0]
+    width = float(base_page.mediabox.width)
+    height = float(base_page.mediabox.height)
+
+    overlay_stream = fallback_pdf_writer(sections, width, height)
+    overlay_pdf = PyPDF2.PdfReader(overlay_stream)
+
+    base_page.merge_page(overlay_pdf.pages[0])
+    writer.add_page(base_page)
+
+    for page in reader.pages[1:]:
+        writer.add_page(page)
+
     output = BytesIO()
-    doc.save(output)
+    writer.write(output)
     output.seek(0)
     return output
 
@@ -151,29 +108,23 @@ def fill_docx_template(doc_stream, sections):
 def process():
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
-
     file = request.files['file']
     prompt = request.form.get('prompt', '').strip()
-    ext = os.path.splitext(secure_filename(file.filename))[1].lower()
+    filename = secure_filename(file.filename)
+    ext = os.path.splitext(filename)[1].lower()
 
     try:
         content = generate_slps_content(prompt)
         sections = parse_lesson_content(content)
 
         if ext == ".pdf":
-            file.stream.seek(0)
-            coords = detect_label_positions(file.stream, LABEL_KEYWORDS)
-            file.stream.seek(0)
-            page_count = len(PyPDF2.PdfReader(file.stream).pages)
-            file.stream.seek(0)
-            filled = fill_pdf(file.stream, sections, coords, page_count)
-            return send_file(filled, mimetype="application/pdf", as_attachment=True,
-                             download_name="Filled_Lesson_Plan.pdf")
+            filled = fill_pdf_static(file.stream, sections)
+            return send_file(filled, mimetype="application/pdf", as_attachment=True, download_name="Lesson_Plan_Filled.pdf")
 
         elif ext == ".docx":
-            output = fill_docx_template(file.stream, sections)
+            output = fill_docx_by_heading(file.stream, sections)
             return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                             as_attachment=True, download_name="Filled_Lesson_Plan.docx")
+                             as_attachment=True, download_name="Lesson_Plan_Filled.docx")
 
         else:
             return jsonify({"error": "Unsupported file type."}), 400
@@ -184,9 +135,3 @@ def process():
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-    'materials': (100, 615),
-    'vocabulary': (320, 615),
-    'assessment': (100, 580),
-    'success_criteria': (320, 580),
-    'do_now': (_
